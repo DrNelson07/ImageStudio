@@ -1,52 +1,85 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import { CloudUpload, Zap, RotateCw, Download, Image, Settings, Trash2, ChevronLeft, ChevronRight, Wand2, Star, MessageSquare } from 'lucide-react';
 
 // --- CONFIGURAÇÃO DA API GEMINI ---
-// Endpoint para Geração de Imagem (Image-to-Image)
 const IMAGE_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent"; 
-// Endpoint para Geração de Texto e Multimodal (Prompt Enhancement, Captioning e Background Suggestion)
 const TEXT_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"; 
-const API_KEY = ""; // A chave API será injetada automaticamente.
+const API_KEY = "AIzaSyBM-8TsUiIaeDywvl2DwrVhph4s4WnVe-c";
 
-// Parâmetros para simular a geração
+// --- CONFIGURAÇÕES DE SEGURANÇA ---
+const MAX_IMAGE_SIZE = 4 * 1024 * 1024; // 4MB
+const MAX_RETRIES = 3;
+const REQUEST_TIMEOUT = 60000; // 60 segundos
+
 const DEFAULT_PARAMS = {
     steps: 50,
     cfgScale: 7.0,
     seed: 42,
-    candidateCount: 3, // Número TOTAL de variações a gerar (iterativamente)
+    candidateCount: 2, // REDUZIDO para evitar timeouts
 };
 
-// --- INSTRUÇÃO DE SISTEMA PARA PRESERVAÇÃO DE IDENTIDADE (Image-to-Image) ---
 const SYSTEM_INSTRUCTION = "Act as an expert AI photorealism and identity preservation generator. Your EXTREME AND ABSOLUTE PRIMARY TASK is to preserve the face, identity, and likeness of the person from the reference image in all outputs, regardless of the prompt content. You must ensure the person's face (head and neck) is strictly maintained and recognizable in EVERY generated image. For each variation, adapt the setting, lighting, clothing, body posture, and camera angle as requested by the user prompt, while KEEPING THE PERSON AS THE CENTRAL SUBJECT. The output image MUST contain the full face of the reference person. Do not generate generic images or images where the person's identity is compromised. IMPORTANT: Ensure that the generated image is visually distinct from the reference input image, particularly in the background, clothing, and overall composition, to prevent image recitation.";
 
-// --- FUNÇÕES DE UTENSÍLIO ---
+// --- FUNÇÕES CORRIGIDAS ---
 
-// Função utilitária para retry com backoff exponencial
-const fetchWithRetry = async (url, options, retries = 3) => {
+// Função com timeout e tratamento melhorado de erros
+const fetchWithRetry = async (url, options, retries = MAX_RETRIES) => {
     for (let i = 0; i < retries; i++) {
         try {
-            const response = await fetch(url, options);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+            
+            const response = await fetch(url, {
+                ...options,
+                signal: controller.signal
+            });
+            
+            clearTimeout(timeoutId);
+
             if (response.status === 429 && i < retries - 1) { 
                 const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
                 console.warn(`Taxa limite atingida. Tentando novamente em ${Math.ceil(delay / 1000)}s...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
                 continue;
             }
+            
+            if (response.status === 413) {
+                throw new Error('FUNCTION_PAYLOAD_TOO_LARGE');
+            }
+            
+            if (response.status === 504) {
+                throw new Error('FUNCTION_INVOCATION_TIMEOUT');
+            }
+
             if (!response.ok) {
                 const errorBody = await response.text();
                 throw new Error(`Erro na API: ${response.status} - ${errorBody}`);
             }
+            
             return response;
         } catch (error) {
             if (i === retries - 1) throw error;
-            console.error(`Erro na tentativa ${i + 1}:`, error);
+            
+            if (error.name === 'AbortError') {
+                console.warn(`Timeout na tentativa ${i + 1}. Tentando novamente...`);
+            } else {
+                console.error(`Erro na tentativa ${i + 1}:`, error);
+            }
+            
+            const delay = Math.pow(2, i) * 1000;
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
 };
 
-// Função utilitária para converter File para Base64
 const fileToBase64 = (file) => {
     return new Promise((resolve, reject) => {
+        // Verifica tamanho antes de processar
+        if (file.size > MAX_IMAGE_SIZE) {
+            reject(new Error(`Imagem muito grande. Máximo: ${MAX_IMAGE_SIZE / 1024 / 1024}MB`));
+            return;
+        }
+
         const reader = new FileReader();
         reader.readAsDataURL(file);
         reader.onload = () => {
@@ -57,27 +90,52 @@ const fileToBase64 = (file) => {
     });
 };
 
-// --- COMPONENTE PRINCIPAL ---
+// --- TRATAMENTO DE ERROS DA VERCEL ---
+const handleVercelError = (error) => {
+    const errorMsg = error.message || '';
+    
+    if (errorMsg.includes('FUNCTION_INVOCATION_TIMEOUT') || errorMsg.includes('504')) {
+        return 'A geração está demorando muito. Tente com uma imagem menor ou menos variações.';
+    }
+    
+    if (errorMsg.includes('FUNCTION_PAYLOAD_TOO_LARGE') || errorMsg.includes('413')) {
+        return 'A imagem é muito grande. Reduza o tamanho para menos de 4MB.';
+    }
+    
+    if (errorMsg.includes('EDGE_FUNCTION_INVOCATION_FAILED') || errorMsg.includes('500')) {
+        return 'Erro temporário no servidor. Tente novamente em alguns instantes.';
+    }
+    
+    if (errorMsg.includes('429')) {
+        return 'Muitas requisições. Aguarde um momento antes de tentar novamente.';
+    }
+    
+    if (errorMsg.includes('FUNCTION_THROTTLED')) {
+        return 'Limite de uso atingido. Tente novamente mais tarde.';
+    }
+    
+    return errorMsg || 'Erro desconhecido. Tente novamente.';
+};
+
+// --- COMPONENTE PRINCIPAL CORRIGIDO ---
 
 const App = () => {
-    const [mode, setMode] = useState('generate'); // 'generate' (geração) ou 'restore' (restauração)
+    const [mode, setMode] = useState('generate');
     const [prompt, setPrompt] = useState('');
-    const [referenceImage, setReferenceImage] = useState(null); // File object
-    const [imagePreviewUrl, setImagePreviewUrl] = useState(null); // URL for display
-    const [generatedImages, setGeneratedImages] = useState([]); // Array de URLs Base64 dos resultados
-    const [currentImageIndex, setCurrentImageIndex] = useState(0); // Para navegação
+    const [referenceImage, setReferenceImage] = useState(null);
+    const [imagePreviewUrl, setImagePreviewUrl] = useState(null);
+    const [generatedImages, setGeneratedImages] = useState([]);
+    const [currentImageIndex, setCurrentImageIndex] = useState(0);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
-    const [successMessage, setSuccessMessage] = useState(null); // Mensagens de sucesso de LLM/UX
+    const [successMessage, setSuccessMessage] = useState(null);
     const [processingTime, setProcessingTime] = useState(0);
-    const [currentGeneratingIndex, setCurrentGeneratingIndex] = useState(0); // Para UI do carregamento iterativo
+    const [currentGeneratingIndex, setCurrentGeneratingIndex] = useState(0);
     
     // Estados para as funcionalidades LLM
     const [isEnhancing, setIsEnhancing] = useState(false); 
     const [generatedCaptions, setGeneratedCaptions] = useState(null); 
     const [isCaptioning, setIsCaptioning] = useState(false); 
-    
-    // NOVOS ESTADOS para a Sugestão de Fundo
     const [suggestedBackgrounds, setSuggestedBackgrounds] = useState(null); 
     const [isSuggesting, setIsSuggesting] = useState(false); 
 
@@ -85,7 +143,7 @@ const App = () => {
     const [advancedParams, setAdvancedParams] = useState(DEFAULT_PARAMS);
     const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
 
-    // Schema JSON para saída de legendas estruturadas (Multimodal)
+    // Schema JSON para saída de legendas estruturadas
     const CAPTION_SCHEMA = useMemo(() => ({
         type: "OBJECT",
         properties: {
@@ -97,41 +155,75 @@ const App = () => {
         propertyOrdering: ["Inspiradora", "Engraçada", "Misteriosa", "Hashtags"]
     }), []);
 
-
-    // Prompt Otimizado (UX 2.2)
+    // Prompt Otimizado
     const optimizedPrompt = useMemo(() => {
         if (mode === 'generate') {
             if (!prompt) return "N/A";
-            // Adiciona uma instrução base de alta qualidade
             return `${prompt}, imagem de alta resolução, fotorrealista, iluminação dramática, 8k, obra-prima digital.`;
-        } else { // mode === 'restore'
+        } else {
             return `Restaure e aprimore esta foto. Corrija quaisquer danos, melhore a nitidez, o contraste e as cores. Aumente a resolução para a máxima qualidade possível.`;
         }
     }, [prompt, mode]);
 
+    // Efeito para limpar erro após 8 segundos
+    useEffect(() => {
+        if (error) {
+            const timer = setTimeout(() => {
+                setError(null);
+            }, 8000);
+            return () => clearTimeout(timer);
+        }
+    }, [error]);
 
-    // Manipulador de Upload de Imagem
+    // Efeito para limpar sucesso após 5 segundos
+    useEffect(() => {
+        if (successMessage) {
+            const timer = setTimeout(() => {
+                setSuccessMessage(null);
+            }, 5000);
+            return () => clearTimeout(timer);
+        }
+    }, [successMessage]);
+
+    // Manipulador de Upload de Imagem CORRIGIDO
     const handleImageUpload = useCallback((event) => {
         const file = event.target.files[0];
-        if (file) {
-            setReferenceImage(file);
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                setImagePreviewUrl(reader.result);
-            };
-            reader.readAsDataURL(file);
-            // Limpa dados de LLM ao carregar nova imagem
-            setSuggestedBackgrounds(null);
-            setGeneratedCaptions(null);
-            setGeneratedImages([]);
+        if (!file) return;
+
+        // Validações de segurança
+        if (!file.type.startsWith('image/')) {
+            setError('Por favor, selecione um arquivo de imagem válido (JPEG, PNG, etc.).');
+            return;
         }
+
+        if (file.size > MAX_IMAGE_SIZE) {
+            setError(`Imagem muito grande. Máximo permitido: ${MAX_IMAGE_SIZE / 1024 / 1024}MB`);
+            return;
+        }
+
+        setReferenceImage(file);
+        setError(null);
+        setSuccessMessage(null);
+        
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            setImagePreviewUrl(reader.result);
+        };
+        reader.onerror = () => {
+            setError('Erro ao carregar a imagem. Tente novamente.');
+        };
+        reader.readAsDataURL(file);
+        
+        // Limpa dados antigos
+        setSuggestedBackgrounds(null);
+        setGeneratedCaptions(null);
+        setGeneratedImages([]);
     }, []);
 
-    // --- FUNÇÃO LLM 1: Otimizador de Prompt (Text Generation) ---
+    // --- FUNÇÃO LLM 1: Otimizador de Prompt CORRIGIDA ---
     const handlePromptEnhance = useCallback(async () => {
-        if (!prompt) {
+        if (!prompt.trim()) {
             setError("Por favor, insira um prompt inicial para otimizar.");
-            setSuccessMessage(null); 
             return;
         }
 
@@ -170,17 +262,16 @@ const App = () => {
 
         } catch (err) {
             console.error("Erro na otimização do prompt:", err);
-            setError(`Erro ao contactar o LLM para otimização: ${err.message}`);
+            setError(handleVercelError(err));
         } finally {
             setIsEnhancing(false);
         }
     }, [prompt]);
 
-    // --- FUNÇÃO LLM 2: Gerador de Legendas (Multimodal Analysis + Text Generation) ---
+    // --- FUNÇÃO LLM 2: Gerador de Legendas CORRIGIDA ---
     const handleCaptionGenerate = useCallback(async () => {
-        if (!generatedImages.length || !referenceImage) {
-            setError("Gere uma imagem primeiro e certifique-se de que a imagem de referência está carregada.");
-            setSuccessMessage(null);
+        if (!referenceImage) {
+            setError("Carregue uma imagem de referência primeiro.");
             return;
         }
 
@@ -190,9 +281,9 @@ const App = () => {
         setGeneratedCaptions(null);
 
         try {
-            const systemPrompt = "You are a social media manager specializing in visual content. Your task is to analyze the provided image (the reference person) and the user's creative prompt to generate compelling, short social media captions and a set of relevant hashtags. The captions should reflect the style and theme requested in the prompt. Output the response STRICTLY as a JSON object following the provided schema.";
+            const systemPrompt = "You are a social media manager specializing in visual content. Your task is to analyze the provided image and generate compelling social media captions. Output the response STRICTLY as a JSON object following the provided schema.";
             
-            const analysisPrompt = `Analyze the person in the image and the following creative description/goal: "${optimizedPrompt}". Generate captions (inspiring, funny, mysterious) and a list of 5-10 trending hashtags based on this combination.`;
+            const analysisPrompt = `Analyze the person in the image and generate captions based on their appearance and style.`;
             
             const base64ImageData = await fileToBase64(referenceImage);
             
@@ -227,26 +318,29 @@ const App = () => {
             
             if (jsonText) {
                 const cleanJsonText = jsonText.replace(/^```json\s*|```\s*$/g, '').trim();
-                const parsedCaptions = JSON.parse(cleanJsonText);
-                setGeneratedCaptions(parsedCaptions);
-                setSuccessMessage("Legendas geradas com sucesso!");
+                try {
+                    const parsedCaptions = JSON.parse(cleanJsonText);
+                    setGeneratedCaptions(parsedCaptions);
+                    setSuccessMessage("Legendas geradas com sucesso!");
+                } catch (parseError) {
+                    setError("Erro ao processar as legendas. Tente novamente.");
+                }
             } else {
-                setError("Falha ao gerar legendas. Resposta do LLM inválida.");
+                setError("Falha ao gerar legendas. Tente novamente.");
             }
 
         } catch (err) {
             console.error("Erro na geração de legendas:", err);
-            setError(`Erro ao gerar legendas: ${err.message}`);
+            setError(handleVercelError(err));
         } finally {
             setIsCaptioning(false);
         }
-    }, [generatedImages.length, optimizedPrompt, referenceImage, CAPTION_SCHEMA]);
+    }, [referenceImage, CAPTION_SCHEMA]);
 
-    // --- NOVA FUNÇÃO LLM 3: Gerador de Sugestões de Fundo (Multimodal Analysis) ---
+    // --- FUNÇÃO LLM 3: Sugestões de Fundo CORRIGIDA ---
     const handleBackgroundSuggestion = useCallback(async () => {
         if (!referenceImage) {
-            setError("Por favor, carregue uma imagem de referência primeiro para que a IA possa analisá-la.");
-            setSuccessMessage(null);
+            setError("Por favor, carregue uma imagem de referência primeiro.");
             return;
         }
 
@@ -256,9 +350,9 @@ const App = () => {
         setSuggestedBackgrounds(null);
 
         try {
-            const systemPrompt = "You are a visual stylist and background expert. Analyze the person's clothing, style, pose, and color palette in the image. Based on this analysis, generate 5 distinct, high-detail background scenes suitable for image generation prompts. The suggestions should include a mix of contrasting (e.g., modern person in ancient setting) and complementary (e.g., formal person in a luxurious setting) environments. Output ONLY a numbered list of the 5 suggestions, without any introductory or concluding text.";
+            const systemPrompt = "You are a visual stylist and background expert. Analyze the person's clothing, style, pose, and color palette in the image. Based on this analysis, generate 3 distinct background scenes suitable for image generation prompts. Output ONLY a numbered list of the 3 suggestions, without any introductory or concluding text.";
             
-            const analysisPrompt = "Analyze this person and suggest 5 photorealistic background prompts.";
+            const analysisPrompt = "Analyze this person and suggest 3 photorealistic background prompts.";
             
             const base64ImageData = await fileToBase64(referenceImage);
             
@@ -288,37 +382,35 @@ const App = () => {
             const suggestionsText = result.candidates?.[0]?.content?.parts?.[0]?.text;
 
             if (suggestionsText) {
-                // Converte a lista numerada em um array de strings
                 const suggestionsArray = suggestionsText.split('\n')
                     .map(line => line.replace(/^\d+\.\s*/, '').trim())
-                    .filter(line => line.length > 0);
+                    .filter(line => line.length > 0)
+                    .slice(0, 3); // Limita a 3 sugestões
                     
                 setSuggestedBackgrounds(suggestionsArray);
-                setSuccessMessage("Sugestões de fundo geradas com sucesso. Use-as no seu prompt!");
+                setSuccessMessage("Sugestões de fundo geradas com sucesso!");
             } else {
-                setError("Falha ao gerar sugestões de fundo. Resposta do LLM inválida.");
+                setError("Falha ao gerar sugestões de fundo. Tente novamente.");
             }
 
         } catch (err) {
             console.error("Erro na sugestão de fundo:", err);
-            setError(`Erro ao gerar sugestões de fundo: ${err.message}`);
+            setError(handleVercelError(err));
         } finally {
             setIsSuggesting(false);
         }
     }, [referenceImage]);
 
-
-    // Manipulador de Geração de Imagem - AGORA ITERATIVO E RESILIENTE
+    // --- FUNÇÃO PRINCIPAL DE GERAÇÃO COMPLETAMENTE CORRIGIDA ---
     const handleGenerate = useCallback(async () => {
-        // Validação
-        if (mode === 'generate' && (!prompt || !referenceImage)) {
-            setError("Por favor, forneça um prompt de texto e uma imagem de referência.");
-            setSuccessMessage(null);
+        // Validação robusta
+        if (!referenceImage) {
+            setError("Por favor, carregue uma imagem de referência.");
             return;
         }
-        if (mode === 'restore' && !referenceImage) {
-            setError("Por favor, envie uma foto para ser restaurada.");
-            setSuccessMessage(null);
+        
+        if (mode === 'generate' && !prompt.trim()) {
+            setError("Por favor, forneça uma descrição para a geração.");
             return;
         }
 
@@ -327,33 +419,37 @@ const App = () => {
         setSuccessMessage(null); 
         setGeneratedImages([]); 
         setGeneratedCaptions(null); 
-        setSuggestedBackgrounds(null); // Limpa sugestões
+        setSuggestedBackgrounds(null);
         setCurrentImageIndex(0);
         setCurrentGeneratingIndex(0);
         setProcessingTime(0);
+        
         const startTime = Date.now();
 
         try {
             const finalPromptBase = optimizedPrompt;
-            const totalVariations = advancedParams.candidateCount;
+            const totalVariations = Math.min(advancedParams.candidateCount, 3); // MAXIMO 3
             const newGeneratedImages = [];
             let attemptCount = 0; 
+            const MAX_TOTAL_ATTEMPTS = totalVariations * 2;
 
-            // 1. Lê a imagem em Base64 UMA VEZ antes do loop
+            // Lê a imagem UMA vez
             const base64ImageData = await fileToBase64(referenceImage);
 
-            // Loop while para garantir que geramos o número total de variações bem-sucedidas
-            while (newGeneratedImages.length < totalVariations && attemptCount < totalVariations * 2) { // Adiciona um limite de tentativas para evitar loops infinitos
+            for (let i = 0; i < totalVariations && attemptCount < MAX_TOTAL_ATTEMPTS; i++) {
                 attemptCount++;
-                const currentImageNumber = newGeneratedImages.length + 1; 
+                const currentImageNumber = i + 1;
 
-                setCurrentGeneratingIndex(currentImageNumber); // Atualiza o índice de carregamento
+                setCurrentGeneratingIndex(currentImageNumber);
 
-                // 2. Constrói o User Query Iterativo (para forçar variação e incluir o número da tentativa)
-                const querySuffix = ` Crie a Variação N.º ${currentImageNumber} do pedido. Altere a pose, ângulo de câmara, iluminação, ou vestuário ligeiramente em relação às variações anteriores. (Tentativa ${attemptCount})`;
+                // Delay progressivo entre requisições
+                if (i > 0) {
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+
+                const querySuffix = ` Variação ${currentImageNumber} - altere pose, ângulo ou iluminação.`;
                 const userQueryText = finalPromptBase + querySuffix;
                 
-                // 3. Constrói o Payload com System Instruction
                 const payload = {
                     systemInstruction: {
                         parts: [{ text: SYSTEM_INSTRUCTION }]
@@ -375,56 +471,52 @@ const App = () => {
                     },
                 };
 
-                // 4. Chamada à API e Atualização do Estado.
-                const response = await fetchWithRetry(`${IMAGE_API_URL}?key=${API_KEY}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
+                try {
+                    const response = await fetchWithRetry(`${IMAGE_API_URL}?key=${API_KEY}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
 
-                const result = await response.json();
-                const candidate = result?.candidates?.[0];
-                const finishReason = candidate?.finishReason;
-                const base64Data = candidate?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
-                const mimeType = candidate?.content?.parts?.find(p => p.inlineData)?.inlineData?.mimeType || 'image/png';
+                    const result = await response.json();
+                    const candidate = result?.candidates?.[0];
+                    const finishReason = candidate?.finishReason;
+                    const base64Data = candidate?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+                    const mimeType = candidate?.content?.parts?.find(p => p.inlineData)?.inlineData?.mimeType || 'image/png';
 
-                if (base64Data) {
-                    newGeneratedImages.push(`data:${mimeType};base64,${base64Data}`);
-                    setGeneratedImages([...newGeneratedImages]);
-                    setCurrentImageIndex(newGeneratedImages.length - 1); 
-                } else {
-                    console.error(`Falha ao gerar a imagem ${currentImageNumber} (Tentativa ${attemptCount}).`, result);
-                    
-                    let errorMessage = `Falha na variação ${currentImageNumber}. Resposta da API inválida.`;
-                    
-                    if (finishReason === 'SAFETY') {
-                        errorMessage = `Falha na variação ${currentImageNumber}. A imagem foi bloqueada por razões de segurança.`;
-                    } else if (finishReason === 'NO_IMAGE') {
-                        errorMessage = `Falha na variação ${currentImageNumber}. O modelo não conseguiu gerar a imagem.`;
-                    } else if (finishReason === 'IMAGE_RECITATION') {
-                        // FIX: Tratamento específico para o erro de Recitação
-                        errorMessage = `Falha na variação ${currentImageNumber}. Recusa de Geração: A imagem gerada era demasiado semelhante à foto de referência ou a imagens de treino do modelo (Recitação). Tente mudar o prompt para um cenário ou estilo mais distinto.`;
-                    } else if (result.error) {
-                         errorMessage = `Falha na variação ${currentImageNumber}. Erro da API: ${result.error.message}`;
+                    if (base64Data) {
+                        newGeneratedImages.push(`data:${mimeType};base64,${base64Data}`);
+                        setGeneratedImages([...newGeneratedImages]);
+                    } else {
+                        console.warn(`Variação ${currentImageNumber} falhou. Razão:`, finishReason);
+                        // Continua para próxima variação em vez de quebrar
                     }
-
-                    console.warn(`[AVISO NÃO CRÍTICO - TENTANDO NOVAMENTE] ${errorMessage}`);
+                } catch (apiError) {
+                    console.warn(`Erro na variação ${currentImageNumber}:`, apiError);
+                    // Continua para próxima variação
                 }
             }
             
-            setProcessingTime((Date.now() - startTime) / 1000);
-            setSuccessMessage(null); // Remove mensagens de sucesso LLM para dar lugar ao sucesso da geração
+            const totalTime = (Date.now() - startTime) / 1000;
+            setProcessingTime(totalTime);
+
+            if (newGeneratedImages.length > 0) {
+                setSuccessMessage(`Sucesso! ${newGeneratedImages.length} imagem(ns) gerada(s) em ${totalTime.toFixed(1)}s`);
+                setCurrentImageIndex(0);
+            } else {
+                setError("Não foi possível gerar nenhuma imagem. Tente com parâmetros diferentes.");
+            }
 
         } catch (err) {
-            console.error("Erro durante a geração/restauração:", err);
-            setError(`Ocorreu um erro CRÍTICO: ${err.message}. O processo foi interrompido.`);
+            console.error("Erro crítico na geração:", err);
+            setError(handleVercelError(err));
         } finally {
             setLoading(false);
-            setCurrentGeneratingIndex(0); // Reinicia
+            setCurrentGeneratingIndex(0);
         }
     }, [mode, prompt, referenceImage, optimizedPrompt, advancedParams.candidateCount]);
 
-    // Função de download
+    // Funções auxiliares (mantidas como estavam)
     const handleDownload = useCallback(() => {
         if (generatedImages[currentImageIndex]) {
             const link = document.createElement('a');
@@ -437,7 +529,6 @@ const App = () => {
         }
     }, [generatedImages, currentImageIndex, mode]);
 
-    // Função de download de todos
     const handleDownloadAll = useCallback(() => {
         if (generatedImages.length === 0) return;
         generatedImages.forEach((base64Url, index) => {
@@ -451,7 +542,6 @@ const App = () => {
         });
     }, [generatedImages, mode]);
     
-    // Função de navegação
     const navigateImage = (direction) => {
         setCurrentImageIndex(prevIndex => {
             const newIndex = prevIndex + direction;
@@ -461,7 +551,23 @@ const App = () => {
         });
     };
 
-    // Componente de Botão de Modo
+    const copyToClipboard = useCallback(async (text) => {
+        try {
+            await navigator.clipboard.writeText(text);
+            setSuccessMessage("Texto copiado para a área de transferência!");
+        } catch (err) {
+            // Fallback para browsers antigos
+            const el = document.createElement('textarea');
+            el.value = text;
+            document.body.appendChild(el);
+            el.select();
+            document.execCommand('copy');
+            document.body.removeChild(el);
+            setSuccessMessage("Texto copiado para a área de transferência!");
+        }
+    }, []);
+
+    // Componentes auxiliares (mantidos como estavam)
     const ModeButton = ({ value, label, Icon }) => (
         <button
             onClick={() => {
@@ -487,7 +593,6 @@ const App = () => {
         </button>
     );
 
-    // Componente de Entrada de Parâmetros Avançados
     const AdvancedSetting = ({ label, name, min, max, step }) => (
         <div className="flex justify-between items-center py-2">
             <label htmlFor={name} className="text-sm font-medium text-gray-600">{label}</label>
@@ -504,27 +609,6 @@ const App = () => {
             />
         </div>
     );
-    
-    // Utilitário para copiar para a área de transferência
-    const copyToClipboard = useCallback(async (text) => {
-        try {
-            // Usa o comando execCommand como fallback robusto em ambientes iframe
-            const el = document.createElement('textarea');
-            el.value = text;
-            document.body.appendChild(el);
-            el.select();
-            document.execCommand('copy');
-            document.body.removeChild(el);
-
-            setError(null);
-            setSuccessMessage("Texto copiado para a área de transferência!"); 
-        } catch (err) {
-            setSuccessMessage(null);
-            setError("Falha ao copiar. O seu navegador pode não suportar esta funcionalidade.");
-            console.error('Copy failed:', err);
-        }
-    }, []);
-
 
     return (
         <div className="min-h-screen bg-gray-50 font-sans p-4 sm:p-8">
@@ -546,13 +630,13 @@ const App = () => {
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                    {/* Painel de Controle (Col 1 & 2) */}
+                    {/* Painel de Controle */}
                     <div className="lg:col-span-2 space-y-6 bg-white p-6 rounded-2xl shadow-xl border border-gray-100">
                         <h2 className="text-2xl font-bold text-gray-800 border-b pb-2">
                             {mode === 'generate' ? 'Geração Multimodal' : 'Restauração de Qualidade Máxima'}
                         </h2>
 
-                        {/* 1. Upload de Imagem de Referência */}
+                        {/* 1. Upload de Imagem */}
                         <div className="space-y-3">
                             <label className="block text-lg font-medium text-gray-700">
                                 1. Imagem de Referência (Rosto/Foto Antiga)
@@ -580,12 +664,12 @@ const App = () => {
                                 )}
                             </div>
                             <p className="text-xs text-gray-500">
-                                A imagem será enviada para a IA para preservar a identidade do rosto em todas as variações.
+                                Tamanho máximo: 4MB. Formatos: JPEG, PNG, WebP
                             </p>
                         </div>
 
-                        {/* 2. Descrição Textual (Prompt) */}
-                        {mode === 'generate' && ( // Este bloco SÓ aparece no modo 'generate'
+                        {/* 2. Descrição Textual */}
+                        {mode === 'generate' && (
                             <div className="space-y-3">
                                 <label htmlFor="prompt" className="block text-lg font-medium text-gray-700">
                                     2. Descrição Desejada (Cenário/Estilo)
@@ -601,7 +685,6 @@ const App = () => {
                                 
                                 {/* Botões LLM */}
                                 <div className="flex flex-col gap-2">
-                                    {/* RECURSO LLM: Otimizador de Prompt */}
                                     <button
                                         onClick={handlePromptEnhance}
                                         disabled={!prompt || isEnhancing || loading || isCaptioning || isSuggesting}
@@ -620,7 +703,6 @@ const App = () => {
                                         )}
                                     </button>
 
-                                    {/* NOVO RECURSO LLM: Sugerir Fundos */}
                                     <button
                                         onClick={handleBackgroundSuggestion}
                                         disabled={!referenceImage || isSuggesting || loading || isEnhancing || isCaptioning}
@@ -641,16 +723,16 @@ const App = () => {
                                 </div>
                                 
                                 <p className="text-sm text-gray-500 mt-2">
-                                    <span className="font-semibold">Prompt Final (Base para a IA):</span> {optimizedPrompt}
+                                    <span className="font-semibold">Prompt Final:</span> {optimizedPrompt}
                                 </p>
                             </div>
                         )}
 
-                        {/* Display de Sugestões de Fundo */}
+                        {/* Sugestões de Fundo */}
                         {suggestedBackgrounds && (
                             <div className="bg-white border border-orange-200 rounded-xl p-4 shadow-inner">
                                 <h3 className="font-bold text-orange-700 mb-2 flex items-center">
-                                    <MessageSquare className="w-4 h-4 mr-1"/> Sugestões de Fundos para a sua Pessoa:
+                                    <MessageSquare className="w-4 h-4 mr-1"/> Sugestões de Fundos:
                                 </h3>
                                 <ul className="space-y-2 text-sm text-gray-700 list-disc list-inside">
                                     {suggestedBackgrounds.map((suggestion, index) => (
@@ -659,9 +741,8 @@ const App = () => {
                                             <button 
                                                 onClick={() => copyToClipboard(suggestion)}
                                                 className="text-orange-600 hover:text-orange-800 flex-shrink-0 ml-2"
-                                                title="Copiar Sugestão para Prompt"
+                                                title="Copiar Sugestão"
                                             >
-                                                {/* Ícone de Cópia */}
                                                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="10" y="4" width="12" height="12" rx="2" ry="2"></rect><path d="M16 8v-2a2 2 0 0 0 -2 -2h-8a2 2 0 0 0 -2 2v8a2 2 0 0 0 2 2h2"></path></svg>
                                             </button>
                                         </li>
@@ -670,7 +751,7 @@ const App = () => {
                             </div>
                         )}
 
-                        {/* 3. Configurações Avançadas */}
+                        {/* Configurações Avançadas */}
                         <div className="border border-gray-200 rounded-xl p-4 bg-gray-50">
                             <button
                                 onClick={() => setIsAdvancedOpen(!isAdvancedOpen)}
@@ -684,12 +765,9 @@ const App = () => {
                             </button>
                             {isAdvancedOpen && (
                                 <div className="mt-4 space-y-2">
-                                    <AdvancedSetting label="Passos de Geração (Steps)" name="steps" min={10} max={150} step={1} />
-                                    <AdvancedSetting label="Escala CFG (CFG Scale)" name="cfgScale" min={1.0} max={30.0} step={0.5} />
-                                    <AdvancedSetting label="Semente de Geração (Seed)" name="seed" min={0} max={999999} step={1} />
-                                    <AdvancedSetting label="Variações (Geração Iterativa)" name="candidateCount" min={1} max={5} step={1} />
+                                    <AdvancedSetting label="Variações a Gerar" name="candidateCount" min={1} max={3} step={1} />
                                     <p className="text-xs text-gray-500 mt-2 pt-2 border-t">
-                                        O sistema fará {advancedParams.candidateCount} chamadas individuais à API para gerar variações.
+                                        Recomendado: 1-2 variações para melhor performance
                                     </p>
                                 </div>
                             )}
@@ -704,43 +782,41 @@ const App = () => {
                             {loading ? (
                                 <>
                                     <span className="animate-spin mr-3 border-4 border-white border-t-transparent rounded-full h-6 w-6"></span>
-                                    Processando Imagem {currentGeneratingIndex} de {advancedParams.candidateCount}...
+                                    Processando {currentGeneratingIndex} de {advancedParams.candidateCount}...
                                 </>
                             ) : (
                                 <>
                                     <Zap className="w-6 h-6 mr-2" />
-                                    {'Gerar Variações'}
+                                    {mode === 'generate' ? 'Gerar Variações' : 'Restaurar Foto'}
                                 </>
                             )}
                         </button>
 
-                        {/* Indicador de Status - MENSAGEM DE SUCESSO DO LLM */}
+                        {/* Mensagens de Status */}
                         {successMessage && (
                             <div className="p-3 text-sm font-medium text-teal-700 bg-teal-100 rounded-lg" role="alert">
-                                Sucesso: {successMessage}
+                                ✅ {successMessage}
                             </div>
                         )}
                         
-                        {/* Indicador de Status - MENSAGEM DE ERRO */}
                         {error && (
                             <div className="p-3 text-sm font-medium text-red-700 bg-red-100 rounded-lg" role="alert">
-                                Erro: {error}
+                                ❌ {error}
                             </div>
                         )}
                         
-                        {/* Indicador de Status - TEMPO DE PROCESSAMENTO (Sucesso de Geração) */}
                         {processingTime > 0 && !error && (
                             <div className="p-3 text-sm font-medium text-green-700 bg-green-100 rounded-lg" role="alert">
-                                Geração Concluída! {generatedImages.length} imagem(ns) foi(foram) gerada(s) em {processingTime.toFixed(2)} segundos.
+                                ⚡ {generatedImages.length} imagem(ns) gerada(s) em {processingTime.toFixed(1)}s
                             </div>
                         )}
 
-                        {/* RECURSO LLM: Gerador de Legendas */}
+                        {/* Gerador de Legendas */}
                         {generatedImages.length > 0 && (
                             <div className="pt-4 border-t border-gray-100 space-y-3">
                                 <button
                                     onClick={handleCaptionGenerate}
-                                    disabled={isCaptioning || loading || !generatedImages.length || !referenceImage || isSuggesting}
+                                    disabled={isCaptioning || loading}
                                     className="w-full flex items-center justify-center py-2 px-4 border border-transparent text-sm font-semibold rounded-xl text-white bg-teal-500 hover:bg-teal-600 focus:outline-none focus:ring-4 focus:ring-teal-500 focus:ring-opacity-50 disabled:bg-teal-300 transition duration-150"
                                 >
                                     {isCaptioning ? (
@@ -756,7 +832,6 @@ const App = () => {
                                     )}
                                 </button>
                                 
-                                {/* Exibição das Legendas Geradas */}
                                 {generatedCaptions && (
                                     <div className="bg-white border border-teal-200 rounded-xl p-4 shadow-inner">
                                         <h3 className="font-bold text-teal-700 mb-2">Sugestões de Legendas:</h3>
@@ -771,7 +846,6 @@ const App = () => {
                                                             className="text-teal-600 hover:text-teal-800 flex-shrink-0"
                                                             title="Copiar Legenda"
                                                         >
-                                                            {/* Ícone de Cópia */}
                                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="10" y="4" width="12" height="12" rx="2" ry="2"></rect><path d="M16 8v-2a2 2 0 0 0 -2 -2h-8a2 2 0 0 0 -2 2v8a2 2 0 0 0 2 2h2"></path></svg>
                                                         </button>
                                                     </div>
@@ -784,7 +858,7 @@ const App = () => {
                         )}
                     </div>
 
-                    {/* Área de Exibição de Resultados (Col 3) */}
+                    {/* Área de Resultados */}
                     <div className="lg:col-span-1 bg-white p-6 rounded-2xl shadow-xl border border-gray-100 h-full flex flex-col">
                         <h2 className="text-2xl font-bold text-gray-800 border-b pb-2 mb-4">Resultado</h2>
 
@@ -820,14 +894,16 @@ const App = () => {
                                 <div className="text-center p-8">
                                     <RotateCw className="w-10 h-10 animate-spin text-indigo-500 mx-auto" />
                                     <p className="mt-4 text-gray-600">
-                                        Renderizando Imagem {currentGeneratingIndex} de {advancedParams.candidateCount}... <br />
-                                        Tempo estimado por imagem: 20-40 segundos.
+                                        Gerando Imagem {currentGeneratingIndex} de {advancedParams.candidateCount}...
+                                    </p>
+                                    <p className="text-sm text-gray-500 mt-2">
+                                        Tempo estimado: 20-60 segundos
                                     </p>
                                 </div>
                             ) : (
                                 <div className="text-center p-8 text-gray-400 border-2 border-dashed border-gray-200 rounded-xl w-full">
                                     <Image className="w-12 h-12 mx-auto mb-2" />
-                                    <p>O resultado da sua imagem aparecerá aqui.</p>
+                                    <p>O resultado aparecerá aqui</p>
                                 </div>
                             )}
                         </div>
@@ -840,14 +916,14 @@ const App = () => {
                                     className="w-full flex items-center justify-center py-3 px-4 text-lg font-bold rounded-xl text-white bg-green-500 hover:bg-green-600 focus:outline-none focus:ring-4 focus:ring-green-500 focus:ring-opacity-50 transition duration-150"
                                 >
                                     <Download className="w-5 h-5 mr-2" />
-                                    Atual ({currentImageIndex + 1})
+                                    Baixar Esta
                                 </button>
                                 <button
                                     onClick={handleDownloadAll}
                                     className="w-full flex items-center justify-center py-3 px-4 text-lg font-bold rounded-xl text-white bg-gray-600 hover:bg-gray-700 focus:outline-none focus:ring-4 focus:ring-gray-500 focus:ring-opacity-50 transition duration-150"
                                 >
                                     <Download className="w-5 h-5 mr-2" />
-                                    Baixar Todos ({generatedImages.length})
+                                    Baixar Todas
                                 </button>
                             </div>
                         )}

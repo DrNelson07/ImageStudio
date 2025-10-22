@@ -1,0 +1,11 @@
+{
+    "functions": {
+        "*.js": {
+            "maxDuration": 60,
+            "memory": 1024
+        }
+    },
+    "env": {
+        "GEMINI_API_KEY": "AIzaSyBM-8TsUiIaeDywvl2DwrVhph4s4WnVe-c"
+    }
+}
